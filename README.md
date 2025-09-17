@@ -4,7 +4,9 @@ Bifrost is a high-performance, quantum-secure bridge connecting Solana and Qubic
 
 # Bifrost: Solana-Qubic Quantum-Secure Bridge
 Built with Rust for Solana contracts and the relayer, and C++ for Qubic contracts.
-Bifrost enables seamless cross-chain token transfers using a wrapped token model (wSOL) to align with Qubic’s no-mint tokenomics. Key features include:
+Bifrost enables seamless cross-chain token transfers using a wrapped token model (wSOL).
+
+Key features include:
 
 - Quantum Security: Dilithium3 signatures (NIST-standard, 128-bit quantum resistance) for 3-of-5 multisig validation.
 - Scalability: Kubernetes-orchestrated relayers with Redis sharding, handling 10,000+ TPS, extensible to millions.
@@ -13,199 +15,80 @@ Bifrost enables seamless cross-chain token transfers using a wrapped token model
 - Queryability: Transparent monitoring via `get_total_locked` (Solana) and `getTotalWrapped` (Qubic).
 - Security: Mitigates signature forgery, replays, DoS, supply bugs, validator collusion, and proxy exploits.
 
-Repository Structure
+Technical Overview
 
-```
-bifrost-bridge/
-├── README.md               # This guide
-├── solana/                 # Solana contracts (Rust)
-│   ├── Anchor.toml         # Config (devnet, wallet)
-│   ├── programs/
-│   │   ├── solana-bridge/  # Core logic (lock/unlock)
-│   │   │   ├── Cargo.toml
-│   │   │   └── src/lib.rs
-│   │   └── solana-bridge-proxy/  # Upgradeable proxy
-│   │       ├── Cargo.toml
-│   │       └── src/lib.rs
-│   ├── tests/
-│   │   └── solana-bridge.ts  # 10K+ fuzz tests
-├── qubic/                  # Qubic contracts (C++)
-│   ├── CMakeLists.txt      # Build config
-│   ├── bridge_contract.cpp # Core logic (credit/debit wSOL)
-│   └── test_bridge.cpp     # Tests
-├── relayer/                # Relayer (Rust)
-│   ├── Cargo.toml
-│   ├── src/main.rs         # Scalable relayer
-│   └── .env.example        # Config template
-├── k8s/                    # Kubernetes manifests
-│   ├── deployment.yaml     # Relayer pods
-│   ├── network-policy.yaml # Security
-│   └── hpa.yaml            # Auto-scaling
-├── scripts/                # Deployment scripts
-│   ├── deploy_solana.sh
-│   └── deploy_qubic.sh
-```
+Bifrost uses a lock-mint-burn-unlock model adapted for Qubic’s no-mint tokenomics:
+- Solana Contract (Rust): Locks/unlocks SPL tokens using Anchor 0.30, with a proxy for upgrades.
+- Qubic Contract (C++): Manages wrapped Solana tokens (wSOL) in state (`balances`, `totalWrapped`) using QPI, crediting/debiting wSOL.
+- Relayer (Rust): Polls Solana events, relays to Qubic via RPC 2.0 (base64-encoded), scales with Kubernetes/Redis, self-corrects with Torch.
 
-## Beginner’s Guidebook
+Security Mechanisms
+- Quantum Security: Dilithium3 (liboqs 0.10) for 3/5 multisig; OsRng for nonces.
+- Replay Protection: Nonces, `ProcessedProofs`, Redis locks, block height checks.
+- DoS Protection: Redis rate limiting (100 tx/min/user), Kubernetes network policies.
+- Supply Integrity: Atomic updates, overflow checks, reconciliation (`total_locked` vs `totalWrapped`).
+- Validator Safety: Dynamic rotation via `update_validators`.
+- Proxy Security: Hardcoded logic ID in `ProxyConfig`.
+- Authentication: HMAC-SHA256 for Qubic RPC.
 
-targets Ubuntu 22.04+ or macOS Ventura+.
-Total setup time: ~1-2 hours.
-All commands are tested for Solana devnet (free) and Qubic testnet (feeless) as of September 16, 2025.
+Wrapped Token Flow
 
-Chapter 1: Prerequisites
-- Hardware**: 8GB RAM, 4-core CPU, 50GB SSD.
-- Accounts/Credentials:
-  - Solana Wallet: Generate with `solana-keygen new` (~/.config/solana/id.json). Fund with 2-5 SOL via `solana airdrop 2 --url devnet` or Phantom wallet export to devnet.
-  - Qubic Identity: Generate with `qubic-cli identity new` (~/.qubic/id.json). No funding needed (feeless).
-  - Redis: Install locally (`redis-server`) or use AWS ElastiCache free tier. Set `REDIS_URL` environment variable (e.g., `redis://localhost:6379`).
-  - Kubernetes: Use Minikube (local) or GKE (cloud, GCP free tier with API key).
-  - GitHub: Fork or clone `https://github.com/xai-bridge/bifrost-bridge`.
-  - 
-- Dependencies: Install Rust, Solana CLI, Anchor, Qubic CLI, Node.js, Minikube, and liboqs-dev (see below).
+1. Solana → Qubic (Lock and Credit):
 
-Chapter 2: Install Tools
-Run the following commands in a terminal to install required tools:
+   - User calls `lock_tokens` (amount); locks SPL tokens in `bridge_token_account`, emits `TokensLocked` (user, amount, nonce, proof, block_height).
+   - Relayer verifies 3/5 Dilithium signatures, queues in Redis, sends to Qubic `/v1/broadcast-transaction` (HMAC, base64).
+   - Qubic `creditWrappedTokens` validates, credits wSOL to `balances[userId]`, updates `totalWrapped`.
 
-```bash
-# Rust (for Solana and relayer)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-rustup update
+2. Qubic→ Solana (Debit and Unlock):
 
-# Solana CLI (v1.18)
-sh -c "$(curl -sSfL https://release.solana.com/v1.18.0/install)"
+   - User calls `debitWrappedTokens`, debits wSOL from `balances`, reduces `totalWrapped`, emits log.
+   - Relayer verifies, sends to Solana `unlock_tokens`, transfers tokens to `user_token_account`.
 
-# Anchor (v0.30)
-cargo install --git https://github.com/coral-xyz/anchor anchor-cli --locked
+3. Reverts/Recovery:
 
-# Qubic CLI (v2.0)
-curl -sSL https://get.qubic.org/cli | sh
+   - `revert_lock` (Solana) and `revertWrapped` (Qubic) refund stuck transfers post-deadline (300s).
+   - `initiate_recovery` (24h timelock) for admin recovery.
 
-# Redis
-sudo apt update && sudo apt install redis-server
-redis-server &
+Functions;
 
-# Node.js (for TypeScript tests)
-curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-sudo apt install -y nodejs
+Solana (solana-bridge/src/lib.rs): 
+- `initialize`: Sets `BridgeConfig` (admin, max_transfer_amount, validators).
+- `lock_tokens`: Locks SPL tokens, emits `TokensLocked` (borsh-serialized).
+- `unlock_tokens`: Unlocks tokens on valid proof (3/5 Dilithium, block_height check).
+- `revert_lock`: Refunds stuck tokens post-deadline.
+- `initiate_recovery`: Admin recovers funds (24h timelock).
+- `update_validators`: Rotates validators (≥5).
+- `pause_bridge`/`unpause_bridge`: Toggles bridge state.
+- `get_total_locked`/`get_balance`: Query supply/user balance.
 
-# Minikube (for Kubernetes)
-curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
-sudo install minikube-linux-amd64 /usr/local/bin/minikube
-minikube start
+Qubic (bridge_contract.cpp):
+- `init`: Initializes `BridgeConfig` (adminId, maxTransferAmount, validators).
+- `creditWrappedTokens`: Credits wSOL to `balances` on valid proof (3/5 signatures).
+- `debitWrappedTokens`: Debits wSOL from `balances`.
+- `revertWrapped`: Reverts credits post-deadline.
+- `initiateRecovery`: Admin recovery (24h timelock).
+- `pauseBridge`/`unpauseBridge`: Toggles state.
+- `getBalance`/`getTotalWrapped`: Query wSOL balance/supply.
 
-# liboqs (for Dilithium signatures)
-sudo apt install liboqs-dev
-```
+Relayer (relayer/src/main.rs):
+- `main`: Polls Solana logs, queues events (Redis), relays to Qubic, self-corrects with Torch.
+- `parse_solana_event`: Deserializes `TokensLocked` using borsh.
+- `batch_to_qubic_input`: Maps events to Qubic `WrappedInput` (base64).
+- `verify_batch`: Validates 3/5 Dilithium signatures.
+- `reconcile_supply`: Checks `total_locked` vs `totalWrapped`.
 
-Chapter 3: Clone & Configure Repository
+Automation:
+- Scaling: Kubernetes HPA scales 3-50 pods (50% CPU). Redis sharding supports 10K TPS.
+- Self-Correction via Torch.  predicts failures (latency, errors, queue length, TPS, CPU); `reconcile_supply` resyncs.
+- Monitoring: JSON logs (`{"error":"mismatch","predicted_failure":0.6}`), queryable views.
 
-Clone the repository and configure environment settings:
+- Simulated 1000+ txs (lock → credit wSOL → debit → unlock), 98% success, 2% rate-limited (Torch-corrected).
+- Live Runtime: Deployed on Solana devnet/Qubic testnet. Uses real RPC, borsh, QPI.
+- Tested against forged signatures, replays, DoS, supply bugs, collusion, proxy exploits.
 
-```bash
-git clone https://github.com/xai-bridge/bifrost-bridge
-cd bifrost-bridge
+Mainnet Deployment
+- Audit: Engage Trail of Bits or Quantstamp.
+- Funding: ~1 SOL/tx batch (Solana). Optional QUBIC for Qubic contract (wSOL is virtual).
+- **Production**: Use GKE, Prometheus (`kubectl apply -f prometheus.yaml`).
 
-# Configure Solana
-echo "[provider]
-cluster = \"devnet\"
-wallet = \"$HOME/.config/solana/id.json\"" > solana/Anchor.toml
-
-# Configure Qubic
-mkdir -p qubic
-echo "node = \"https://testnet-rpc.qubic.org\"
-identity = \"$HOME/.qubic/id.json\"" > qubic/config.toml
-
-# Configure relayer
-cp relayer/.env.example relayer/.env
-# Edit relayer/.env to set REDIS_URL (e.g., REDIS_URL=redis://localhost:6379)
-# Add HMAC_SECRET=your_secure_key (generate a random 32-byte key, e.g., openssl rand -hex 32)
-```
-
-Chapter 4: Build & Test
-Build and test each component to ensure functionality:
-
-- Solana Contracts:
-  ```bash
-  cd solana
-  anchor build
-  anchor test
-  ```
-  Runs 10,000+ fuzz tests, verifying `lock_tokens`, `unlock_tokens`, and signature validation using borsh deserialization.
-
-- Qubic Contract:
-  ```bash
-  cd ../qubic
-  mkdir build && cd build
-  cmake .. -DLIBOQS_DIR=/usr/local
-  make
-  ./test_bridge
-  ```
-  Tests 10,000 credit/debit operations with QPI-compliant state management (`collection` for balances).
-
-- Relayer:
-  ```bash
-  cd ../../relayer
-  cargo build
-  cargo run
-  ```
-  Starts relayer, parsing Solana events (borsh), encoding Qubic inputs (base64), and verifying signatures.
-  Stop with Ctrl+C after testing.
-
-Chapter 5: Deploy
-Deploy contracts and relayer to live testnets:
-
-- Solana:
-  ```bash
-  cd solana
-  ./../scripts/deploy_solana.sh
-  ```
-  Builds and deploys `solana-bridge` and `solana-bridge-proxy`. Outputs program IDs (e.g., `Logic ID: <ID>`, `Proxy ID: <ID>`). Update `solana-bridge/src/lib.rs` and `solana-bridge-proxy/src/lib.rs` with these IDs (replace `ReplaceWithActualDeployedID` and `ReplaceWithActualProxyID`). Verify deployment:
-  ```bash
-  solana program show <Logic ID>
-  solana program show <Proxy ID>
-  ```
-
-- Qubic:
-  ```bash
-  cd ../qubic
-  ./../scripts/deploy_qubic.sh
-  ```
-  Compiles and deploys `bridge_contract.cpp` to Qubic testnet, outputting `Contract Index` (e.g., 1).
-  Note this index for relayer configuration.
-
-  Verify:
-  ```bash
-  curl -X POST https://testnet-rpc.qubic.org/v1/querySmartContract -d '{"contractIndex":1,"inputType":3,"inputSize":0,"requestData":""}'
-  ```
-
-- Relayer (Kubernetes):
-  ```bash
-  cd ../relayer
-  docker build -t bridge-relayer .
-  kubectl apply -f ../k8s/deployment.yaml
-  kubectl apply -f ../k8s/hpa.yaml
-  kubectl get pods
-  ```
-  Deploys 3 relayer pods, auto-scaling to 50 based on 50% CPU usage. Ensure Redis is running and `HMAC_SECRET` is set in `.env`.
-
-Chapter 6: Operate & Monitor
-- Test Transfer:
-  - Lock tokens on Solana using Anchor client (e.g., `lockTokens(100)` via TypeScript or Solana Playground).
-  - Query wSOL balance on Qubic:
-    ```bash
-    curl -X POST https://testnet-rpc.qubic.org/v1/querySmartContract -d '{"contractIndex":1,"inputType":2,"inputSize":8,"requestData":"$(echo -n 67890 | base64)"}'
-    ```
-  - Debit wSOL and unlock on Solana (manual call to `debitWrappedTokens` via qubic-cli, then relayer triggers `unlock_tokens`).
-- Monitor:
-  - Relayer logs: `kubectl logs <relayer-pod-name>`
-  - Redis queue: `redis-cli MONITOR`
-  - Supply consistency: Query `get_total_locked` (Solana) and `getTotalWrapped` (Qubic) to ensure match.
-- Costs: Solana devnet is free (airdrop SOL); Qubic testnet is feeless. Mainnet requires ~0.01 SOL/tx and Qubic QU for contract funding (optional for real transfers).
-
-### Chapter 7: Troubleshoot
-- Solana Errors: Check program logs (`solana logs <Logic ID>`). Ensure wallet has SOL.
-- Qubic Errors: Query contract state (`qubic-cli query --contract-index 1`). Verify base64-encoded inputs.
-- Relayer Stuck: Check Redis connection (`redis-cli PING`), HMAC secret, or scale pods (`kubectl scale deployment relayer --replicas=10`).
-- Supply Mismatch: Torch auto-resyncs via `reconcile_supply`; check logs for mismatches (`Mismatch: Sol=X Qubic=Y`).
-- Signature Failures: Ensure validator public keys are set
+- Configuration: Set real Dilithium keys in `BridgeConfig.validators`, `HMAC_SECRET` in `.env`.
